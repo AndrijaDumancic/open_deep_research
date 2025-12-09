@@ -9,12 +9,14 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiohttp
 from langchain.chat_models import init_chat_model
+from langchain_openai import ChatOpenAI
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     MessageLikeRepresentation,
     filter_messages,
+    SystemMessage
 )
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import (
@@ -32,6 +34,31 @@ from tavily import AsyncTavilyClient
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
+
+
+def get_litellm_model(model_name: str, max_tokens: int = None, temperature: float = 0) -> ChatOpenAI:
+    """Creates a ChatOpenAI client pointed at the LiteLLM Proxy.
+    
+    Args:
+        model_name: The model name/alias as configured in LiteLLM
+        max_tokens: Maximum tokens for response
+        temperature: Sampling temperature
+        
+    Returns:
+        Configured ChatOpenAI instance pointing to LiteLLM proxy
+    """
+    base_url = os.getenv("LITELLM_BASE_URL", "http://0.0.0.0:4000")
+    api_key = os.getenv("LITELLM_API_KEY", "sk-1234")
+
+    return ChatOpenAI(
+        model=model_name,
+        openai_api_base=base_url,
+        openai_api_key=api_key,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        tags=["langsmith:nostream"]
+    )
+
 
 ##########################
 # Tavily Search Tool Utils
@@ -82,15 +109,17 @@ async def tavily_search(
     max_char_to_include = configurable.max_content_length
     
     # Initialize summarization model with retry logic
-    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
-        model=configurable.summarization_model,
-        max_tokens=configurable.summarization_model_max_tokens,
-        api_key=model_api_key,
-        tags=["langsmith:nostream"]
-    ).with_structured_output(Summary).with_retry(
+    summarization_model = get_litellm_model(
+    model_name=configurable.summarization_model,
+    max_tokens=configurable.summarization_model_max_tokens
+    ).with_structured_output(
+        Summary,
+        method="json_mode",  # Use json_mode for better Azure/LiteLLM compatibility
+        include_raw=False
+    ).with_retry(
         stop_after_attempt=configurable.max_structured_output_retries
     )
+    
     
     # Step 4: Create summarization tasks (skip empty content)
     async def noop():
@@ -189,9 +218,15 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
             date=get_today_str()
         )
         
+        # Add explicit JSON instruction
+        messages = [
+            SystemMessage(content="You must respond with valid JSON only. Do not include any other text or markdown."),
+            HumanMessage(content=prompt_content)
+        ]
+        
         # Execute summarization with timeout to prevent hanging
         summary = await asyncio.wait_for(
-            model.ainvoke([HumanMessage(content=prompt_content)]),
+            model.ainvoke(messages),
             timeout=60.0  # 60 second timeout for summarization
         )
         
@@ -211,7 +246,6 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Other errors during summarization - log and return original content
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
-
 ##########################
 # Reflection Tool Utils
 ##########################

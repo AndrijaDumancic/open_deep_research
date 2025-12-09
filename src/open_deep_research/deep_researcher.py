@@ -2,8 +2,10 @@
 
 import asyncio
 from typing import Literal
-
+import logging
 from langchain.chat_models import init_chat_model
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import ConfigurableField
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -50,11 +52,20 @@ from open_deep_research.utils import (
     openai_websearch_called,
     remove_up_to_last_ai_message,
     think_tool,
+    get_litellm_model
 )
+import os
 
 # Initialize a configurable model that we will use throughout the agent
-configurable_model = init_chat_model(
-    configurable_fields=("model", "max_tokens", "api_key"),
+configurable_model = ChatOpenAI(
+    base_url=os.getenv("LITELLM_BASE_URL", "http://0.0.0.0:4000"),
+    api_key=os.getenv("LITELLM_API_KEY", "sk-1234"),
+    temperature=0,
+    model="gpt-4o",
+).configurable_fields(
+    model_name=ConfigurableField(id="model", name="Model Name"),
+    max_tokens=ConfigurableField(id="max_tokens", name="Max Tokens"),
+    # API key is handled via env var for LiteLLM usually, but can be added if needed
 )
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
@@ -78,40 +89,62 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     
     # Step 2: Prepare the model for structured clarification analysis
     messages = state["messages"]
-    model_config = {
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
-    }
     
-    # Configure model with structured output and retry logic
-    clarification_model = (
-        configurable_model
-        .with_structured_output(ClarifyWithUser)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-        .with_config(model_config)
+    # Use get_litellm_model to create a fresh model instance
+    clarification_model = get_litellm_model(
+        model_name=configurable.research_model,
+        max_tokens=configurable.research_model_max_tokens
+    ).with_structured_output(
+        ClarifyWithUser,
+        method="json_mode",  # Use json_mode for better LiteLLM compatibility
+        include_raw=False
+    ).with_retry(
+        stop_after_attempt=configurable.max_structured_output_retries
     )
     
     # Step 3: Analyze whether clarification is needed
+    # Add explicit instruction for JSON output
     prompt_content = clarify_with_user_instructions.format(
         messages=get_buffer_string(messages), 
         date=get_today_str()
     )
-    response = await clarification_model.ainvoke([HumanMessage(content=prompt_content)])
     
-    # Step 4: Route based on clarification analysis
-    if response.need_clarification:
-        # End with clarifying question for user
+    # Add system message to enforce JSON output
+    clarification_messages = [
+        SystemMessage(content="You must respond with valid JSON only. Do not include any other text."),
+        HumanMessage(content=prompt_content)
+    ]
+    
+    try:
+        response = await clarification_model.ainvoke(clarification_messages)
+        
+        # Handle case where response might still be None
+        if response is None:
+            # Fallback: proceed without clarification
+            return Command(
+                goto="write_research_brief",
+                update={"messages": [AIMessage(content="I'll proceed with the research based on your request.")]}
+            )
+        
+        # Step 4: Route based on clarification analysis
+        if response.need_clarification:
+            # End with clarifying question for user
+            return Command(
+                goto=END, 
+                update={"messages": [AIMessage(content=response.question)]}
+            )
+        else:
+            # Proceed to research with verification message
+            return Command(
+                goto="write_research_brief", 
+                update={"messages": [AIMessage(content=response.verification)]}
+            )
+    except Exception as e:
+        # If structured output fails, proceed without clarification
+        logging.warning(f"Clarification step failed: {e}. Proceeding with research.")
         return Command(
-            goto=END, 
-            update={"messages": [AIMessage(content=response.question)]}
-        )
-    else:
-        # Proceed to research with verification message
-        return Command(
-            goto="write_research_brief", 
-            update={"messages": [AIMessage(content=response.verification)]}
+            goto="write_research_brief",
+            update={"messages": [AIMessage(content="I'll proceed with the research based on your request.")]}
         )
 
 
@@ -131,19 +164,17 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     """
     # Step 1: Set up the research model for structured output
     configurable = Configuration.from_runnable_config(config)
-    research_model_config = {
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
-    }
     
-    # Configure model for structured research question generation
-    research_model = (
-        configurable_model
-        .with_structured_output(ResearchQuestion)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-        .with_config(research_model_config)
+    # Use get_litellm_model to create a fresh model instance
+    research_model = get_litellm_model(
+        model_name=configurable.research_model,
+        max_tokens=configurable.research_model_max_tokens
+    ).with_structured_output(
+        ResearchQuestion,
+        method="json_mode",  # Use json_mode for better LiteLLM compatibility
+        include_raw=False
+    ).with_retry(
+        stop_after_attempt=configurable.max_structured_output_retries
     )
     
     # Step 2: Generate structured research brief from user messages
@@ -151,28 +182,68 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         messages=get_buffer_string(state.get("messages", [])),
         date=get_today_str()
     )
-    response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
     
-    # Step 3: Initialize supervisor with research brief and instructions
-    supervisor_system_prompt = lead_researcher_prompt.format(
-        date=get_today_str(),
-        max_concurrent_research_units=configurable.max_concurrent_research_units,
-        max_researcher_iterations=configurable.max_researcher_iterations
-    )
+    # Add system message to enforce JSON output
+    research_messages = [
+        SystemMessage(content="You must respond with valid JSON only. Do not include any other text."),
+        HumanMessage(content=prompt_content)
+    ]
     
-    return Command(
-        goto="research_supervisor", 
-        update={
-            "research_brief": response.research_brief,
-            "supervisor_messages": {
-                "type": "override",
-                "value": [
-                    SystemMessage(content=supervisor_system_prompt),
-                    HumanMessage(content=response.research_brief)
-                ]
+    try:
+        response = await research_model.ainvoke(research_messages)
+        
+        # Handle case where response might still be None
+        if response is None:
+            # Fallback: create a basic research brief from user messages
+            user_messages = get_buffer_string(state.get("messages", []))
+            fallback_brief = f"Research the following topic: {user_messages[:500]}"
+            response = ResearchQuestion(research_brief=fallback_brief)
+        
+        # Step 3: Initialize supervisor with research brief and instructions
+        supervisor_system_prompt = lead_researcher_prompt.format(
+            date=get_today_str(),
+            max_concurrent_research_units=configurable.max_concurrent_research_units,
+            max_researcher_iterations=configurable.max_researcher_iterations
+        )
+        
+        return Command(
+            goto="research_supervisor", 
+            update={
+                "research_brief": response.research_brief,
+                "supervisor_messages": {
+                    "type": "override",
+                    "value": [
+                        SystemMessage(content=supervisor_system_prompt),
+                        HumanMessage(content=response.research_brief)
+                    ]
+                }
             }
-        }
-    )
+        )
+    except Exception as e:
+        # If structured output fails, create a fallback research brief
+        logging.warning(f"Research brief generation failed: {e}. Using fallback.")
+        user_messages = get_buffer_string(state.get("messages", []))
+        fallback_brief = f"Research the following topic: {user_messages[:500]}"
+        
+        supervisor_system_prompt = lead_researcher_prompt.format(
+            date=get_today_str(),
+            max_concurrent_research_units=configurable.max_concurrent_research_units,
+            max_researcher_iterations=configurable.max_researcher_iterations
+        )
+        
+        return Command(
+            goto="research_supervisor", 
+            update={
+                "research_brief": fallback_brief,
+                "supervisor_messages": {
+                    "type": "override",
+                    "value": [
+                        SystemMessage(content=supervisor_system_prompt),
+                        HumanMessage(content=fallback_brief)
+                    ]
+                }
+            }
+        )
 
 
 async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor_tools"]]:
@@ -191,36 +262,67 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     """
     # Step 1: Configure the supervisor model with available tools
     configurable = Configuration.from_runnable_config(config)
-    research_model_config = {
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
-    }
     
     # Available tools: research delegation, completion signaling, and strategic thinking
     lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool]
     
-    # Configure model with tools, retry logic, and model settings
-    research_model = (
-        configurable_model
-        .bind_tools(lead_researcher_tools)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-        .with_config(research_model_config)
+    # Use get_litellm_model to create a fresh model instance with tools
+    research_model = get_litellm_model(
+        model_name=configurable.research_model,
+        max_tokens=configurable.research_model_max_tokens
+    ).bind_tools(
+        lead_researcher_tools
+    ).with_retry(
+        stop_after_attempt=configurable.max_structured_output_retries
     )
     
     # Step 2: Generate supervisor response based on current context
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await research_model.ainvoke(supervisor_messages)
     
-    # Step 3: Update state and proceed to tool execution
-    return Command(
-        goto="supervisor_tools",
-        update={
-            "supervisor_messages": [response],
-            "research_iterations": state.get("research_iterations", 0) + 1
-        }
-    )
+    try:
+        response = await research_model.ainvoke(supervisor_messages)
+        
+        # Handle case where response might be None or invalid
+        if response is None:
+            logging.warning("Supervisor response was None, creating fallback response")
+            # Create a fallback AIMessage that signals completion
+            response = AIMessage(
+                content="Research complete based on available information.",
+                tool_calls=[{
+                    "name": "ResearchComplete",
+                    "args": {},
+                    "id": "fallback_complete"
+                }]
+            )
+        
+        # Step 3: Update state and proceed to tool execution
+        return Command(
+            goto="supervisor_tools",
+            update={
+                "supervisor_messages": [response],
+                "research_iterations": state.get("research_iterations", 0) + 1
+            }
+        )
+        
+    except Exception as e:
+        logging.error(f"Supervisor encountered error: {e}. Ending research phase.")
+        # Create a completion response to end gracefully
+        response = AIMessage(
+            content=f"Research ended due to error: {str(e)}",
+            tool_calls=[{
+                "name": "ResearchComplete",
+                "args": {},
+                "id": "error_complete"
+            }]
+        )
+        
+        return Command(
+            goto="supervisor_tools",
+            update={
+                "supervisor_messages": [response],
+                "research_iterations": state.get("research_iterations", 0) + 1
+            }
+        )
 
 async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
     """Execute tools called by the supervisor, including research delegation and strategic thinking.
@@ -389,39 +491,61 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         )
     
     # Step 2: Configure the researcher model with tools
-    research_model_config = {
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
-    }
-    
     # Prepare system prompt with MCP context if available
     researcher_prompt = research_system_prompt.format(
         mcp_prompt=configurable.mcp_prompt or "", 
         date=get_today_str()
     )
     
-    # Configure model with tools, retry logic, and settings
-    research_model = (
-        configurable_model
-        .bind_tools(tools)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-        .with_config(research_model_config)
+    # Use get_litellm_model to create a fresh model instance with tools
+    research_model = get_litellm_model(
+        model_name=configurable.research_model,
+        max_tokens=configurable.research_model_max_tokens
+    ).bind_tools(
+        tools
+    ).with_retry(
+        stop_after_attempt=configurable.max_structured_output_retries
     )
     
     # Step 3: Generate researcher response with system context
     messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
-    response = await research_model.ainvoke(messages)
     
-    # Step 4: Update state and proceed to tool execution
-    return Command(
-        goto="researcher_tools",
-        update={
-            "researcher_messages": [response],
-            "tool_call_iterations": state.get("tool_call_iterations", 0) + 1
-        }
-    )
+    try:
+        response = await research_model.ainvoke(messages)
+        
+        # Handle case where response might be None or invalid
+        if response is None:
+            logging.warning("Researcher response was None, creating fallback response")
+            # Create a fallback AIMessage with no tool calls to trigger compression
+            response = AIMessage(
+                content="Unable to conduct further research. Proceeding with available information.",
+                tool_calls=[]
+            )
+        
+        # Step 4: Update state and proceed to tool execution
+        return Command(
+            goto="researcher_tools",
+            update={
+                "researcher_messages": [response],
+                "tool_call_iterations": state.get("tool_call_iterations", 0) + 1
+            }
+        )
+        
+    except Exception as e:
+        logging.error(f"Researcher encountered error: {e}. Ending research.")
+        # Create a response with no tool calls to trigger compression phase
+        response = AIMessage(
+            content=f"Research ended due to error: {str(e)}",
+            tool_calls=[]
+        )
+        
+        return Command(
+            goto="researcher_tools",
+            update={
+                "researcher_messages": [response],
+                "tool_call_iterations": state.get("tool_call_iterations", 0) + 1
+            }
+        )
 
 # Tool Execution Helper Function
 async def execute_tool_safely(tool, args, config):

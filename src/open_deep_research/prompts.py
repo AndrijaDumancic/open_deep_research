@@ -53,6 +53,13 @@ Today's date is {date}.
 
 You will return a single research question that will be used to guide the research.
 
+IMPORTANT: You must return valid JSON with this EXACT structure:
+{{
+  "research_brief": "your detailed research question here"
+}}
+
+The field name must be "research_brief" (not "research_question").
+
 Guidelines:
 1. Maximize Specificity and Detail
 - Include all known user preferences and explicitly list key attributes or dimensions to consider.
