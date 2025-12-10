@@ -10,7 +10,7 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 2. Install dependencies:
 Make sure you have `uv` installed.
-![uv docs](https://docs.astral.sh/uv/getting-started/installation)
+[uv docs](https://docs.astral.sh/uv/getting-started/installation)
 ```bash
 uv sync
 # or
