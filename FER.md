@@ -38,3 +38,15 @@ This will open the LangGraph Studio UI in your browser.
 ```
 
 Ask a question in the `messages` input field and click `Submit`. Select different configuration in the "Manage Assistants" tab.
+
+
+### Workflow
+
+This diagram captures the full lifecycle of the Deep Research Agent, including:
+- Configuration Checks: Logic gates for clarification and API settings.
+- State Management: Passing of ResearchQuestion, AgentState, and SupervisorState.
+- Parallel Execution: The par block showing concurrent sub-agents.
+- Tool Chains: Specific calls to Tavily, Summarizers, and Reflection (think_tool).
+- Error Handling: Retry logic for token limits and formatting.
+
+![Workflow Diagram](./open_deep_research_workflow.svg)
